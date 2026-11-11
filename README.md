@@ -1,455 +1,272 @@
 # x402 Stacks Sponsor Relay
 
-A Cloudflare Worker that enables gasless transactions for AI agents on the Stacks blockchain by sponsoring transactions and verifying payment settlement.
+A Cloudflare Worker that settles [x402](https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md) payments on the Stacks blockchain. Agents and resource servers need a facilitator that can check a signed Stacks transfer (recipient, amount, and token) and broadcast it without running a node. This worker does that locally, then sends the transaction to the Stacks network. Public callers settle self-paid transactions. Fee sponsorship — the sponsor wallet pays the STX fee — is limited to API-key holders on `POST /sponsor` and to trusted same-account workers on the `RelayRPC` service binding, so the public settle endpoint cannot drain the sponsor wallet.
 
-## Overview
+| | |
+|---|---|
+| Staging (testnet) | https://x402-relay.aibtc.dev |
+| Production (mainnet) | https://x402-relay.aibtc.com |
+| OpenAPI | `/openapi.json` |
+| Swagger UI | `/docs` |
+| Agent quick-start | `/llms.txt` |
 
-The [x402 protocol](https://www.x402.org/) is an HTTP-native payment standard that uses the HTTP 402 "Payment Required" status code to enable instant, autonomous stablecoin payments. This relay service brings gasless transactions to Stacks by:
+## Features
 
-1. Accepting pre-signed sponsored transactions from agents
-2. Validating the transaction format (must be sponsored type)
-3. Sponsoring the transaction (covers gas fees)
-4. Calling the x402 facilitator for settlement verification
-5. Storing payment receipts for verification and resource access
-6. Returning the settlement status, sponsored tx hex, and receipt token to the agent
+- **x402 V2 facilitator.** `POST /settle` verifies a payment and broadcasts it. `POST /verify` validates locally and does not broadcast. `GET /supported` advertises scheme `exact`, the worker's CAIP-2 network, and the `payment-identifier` extension.
+- **Self-paid public settlement.** `/settle` accepts a standard transaction (the sender pays its own fee) or one that already has a sponsor signature. A transaction built with an empty sponsor slot (`sponsored: true`, fee 0) is rejected with `invalid_transaction_state`.
+- **Sponsored broadcast.** `POST /sponsor` requires an API key, co-signs a pre-signed sponsored transaction with `PAYMENT_SPONSOR_PRIVATE_KEY`, and broadcasts it. It does not check x402 payment requirements.
+- **Internal gasless payments.** Same-account workers call `RelayRPC`: `sponsorPayment` (sponsor and broadcast now), `submitPayment` (enqueue and return a `paymentId`), `checkPayment`, and `getSponsorStatus`. The public `GET /status/sponsor` returns the same readiness snapshot.
+- **Idempotency.** A `payment-identifier` (`pay_` plus 16–128 characters of `[a-zA-Z0-9_-]`) returns the cached result for the same payload and `409` when the same id is reused with a different payload. Identical transaction hex is also deduplicated.
+- **Queued payments.** `submitPayment` is consumed serially from `PAYMENT_QUEUE`. Callers poll `GET /payment/:id` (`queued`, `broadcasting`, `mempool`, `confirmed`, `failed`, `replaced`, `not_found`). Hiro chainhooks can post confirmations to `POST /webhook/chainhook`.
+- **API keys.** Free-tier keys can be provisioned by signing a fixed message with a Bitcoin key (`POST /keys/provision`, BIP-137 or BIP-322) or a Stacks key (`POST /keys/provision-stx`). Keys last 30 days. Tiers are `free` (10/min, 100/day, 100 STX fee cap), `standard` (60/min, 10,000/day, 1,000 STX), and `unlimited`.
+- **SIP-018 auth.** Optional on `POST /sponsor`. Required, via the `X-SIP018-Auth` header, to read or cancel your own sponsor queue (`GET /queue/:senderAddress`, `DELETE /queue/:senderAddress/:walletIndex/:sponsorNonce`).
+- **Receipts from the removed relay.** `POST /relay` no longer exists and no new receipts are issued. `GET /verify/:receiptId` and `POST /access` still honor receipts already stored in KV.
+- **Operations.** Clamped fee estimates (`GET /fees`), a public stats API (`GET /stats`) and HTML dashboard (`GET /dashboard`), sponsor-wallet inventory (`GET /wallets`), and nonce-pool diagnostics. A cron trigger runs every five minutes for settlement health and optional Telegram sponsor alerts.
+- **Agent discovery.** `/llms.txt`, `/llms-full.txt`, `/topics`, and `/.well-known/agent.json`.
 
-## For downstream consumers
+Supported payment assets are STX, sBTC, and USDCx (or a CAIP-19 contract address on the V2 endpoints). Networks are `stacks:1` (mainnet) and `stacks:2147483648` (testnet), selected by `STACKS_NETWORK`.
 
-If you're building a worker that calls the relay (landing-page, agent-news, mcp-server, x402-api, skills, etc.), start with **[docs/post-337-downstream-contracts.md](./docs/post-337-downstream-contracts.md)** — it covers the RPC service binding (preferred over HTTP), the `/health` shape, and the canonical error contract.
+## Architecture
 
-## API
+```mermaid
+flowchart TD
+  client[HTTP clients]
+  workers[Same-account workers]
+  app[Hono worker]
+  rpc[RelayRPC]
+  settle["/settle and /verify"]
+  sponsor["/sponsor"]
+  queue[PAYMENT_QUEUE]
+  walletDO[SponsorWalletDO]
+  nonceDO[NonceDO]
+  kv[RELAY_KV and API_KEYS_KV]
+  stacks[Stacks node via Hiro]
 
-### POST /sponsor
-
-Sponsor and broadcast a transaction directly (requires API key authentication).
-
-**Headers:**
-```
-Authorization: Bearer x402_sk_test_...
-Content-Type: application/json
-```
-
-**Request:**
-```json
-{
-  "transaction": "<hex-encoded-sponsored-stacks-transaction>"
-}
-```
-
-**Response (success):**
-```json
-{
-  "success": true,
-  "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "txid": "0x...",
-  "explorerUrl": "https://explorer.hiro.so/txid/0x...?chain=testnet",
-  "fee": "1000"
-}
-```
-
-**Response (error):**
-```json
-{
-  "success": false,
-  "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "error": "Daily spending cap exceeded",
-  "code": "SPENDING_CAP_EXCEEDED",
-  "details": "Your API key has exceeded its daily spending limit.",
-  "retryable": true,
-  "retryAfter": 3600
-}
+  client --> app
+  workers --> rpc
+  app --> settle
+  app --> sponsor
+  settle --> stacks
+  sponsor --> walletDO
+  rpc --> walletDO
+  rpc --> queue
+  queue --> walletDO
+  walletDO --> stacks
+  app --> nonceDO
+  app --> kv
+  rpc --> kv
 ```
 
-| Error Code | HTTP Status | Description |
-|------------|-------------|-------------|
-| `MISSING_API_KEY` | 401 | No API key provided |
-| `INVALID_API_KEY` | 401 | API key not found or revoked |
-| `EXPIRED_API_KEY` | 401 | API key has expired |
-| `MISSING_TRANSACTION` | 400 | Transaction field is missing |
-| `INVALID_TRANSACTION` | 400 | Transaction is malformed |
-| `NOT_SPONSORED` | 400 | Transaction must be built with `sponsored: true` |
-| `SPENDING_CAP_EXCEEDED` | 429 | Daily fee cap exceeded for this API key tier |
-| `BROADCAST_FAILED` | 502 | Transaction rejected by network |
+`SponsorWalletDO` is the single payment-sponsor wallet. It signs with `PAYMENT_SPONSOR_PRIVATE_KEY`, reads the sponsor nonce from the chain at broadcast time, and enforces a daily fee budget (default 10 STX, overridable with `SPONSOR_DAILY_BUDGET_USTX`). `POST /sponsor` spends a separate budget (`budget:sponsor`) so API-key traffic does not consume the x402 payment budget. `RelayRPC.sponsorPayment` is also limited by the `SPONSOR_RATE_LIMIT` binding (10 requests per 60 seconds per payer, as configured in `wrangler.jsonc`).
 
-### POST /relay
+`NonceDO` coordinates the multi-wallet pool derived from `SPONSOR_MNEMONIC` (accounts `0..SPONSOR_WALLET_COUNT-1`, up to 10). Each wallet allows 20 in-flight sponsored transactions. That pool backs nonce diagnostics, gap-fill, and operator routes such as `GET /nonce/state`. `SPONSOR_PRIVATE_KEY` is a single-key fallback and only covers wallet index 0.
 
-Submit a sponsored transaction for relay and settlement.
+`StatsDO` stores aggregate counters. `RELAY_KV` holds receipts, settlement dedup, the fee cache, health history, and payment records. `API_KEYS_KV` holds API keys. A dead-letter queue marks payments that exhaust queue retries so they are not left in `queued`.
 
-**Request:**
-```json
-{
-  "transaction": "<hex-encoded-sponsored-stacks-transaction>",
-  "settle": {
-    "expectedRecipient": "SP...",
-    "minAmount": "1000000",
-    "tokenType": "STX",
-    "expectedSender": "SP...",
-    "resource": "/api/endpoint",
-    "method": "GET"
-  }
-}
+First-party workers should prefer the service binding over HTTP. The contract is written up in [docs/post-337-downstream-contracts.md](docs/post-337-downstream-contracts.md).
+
+## Prerequisites
+
+- Node.js 22 (the version used in CI) and npm
+- A Cloudflare account and Wrangler login if you deploy or manage remote KV keys
+- For `POST /sponsor` and `RelayRPC` sponsorship: `PAYMENT_SPONSOR_PRIVATE_KEY` and the `SPONSOR_WALLET_DO` binding
+- For the multi-wallet nonce pool: a funded Stacks wallet as a 12- or 24-word `SPONSOR_MNEMONIC` (or `SPONSOR_PRIVATE_KEY` for wallet 0 only)
+- For the manual scripts under `scripts/`: a Stacks account in `.env` (`AGENT_MNEMONIC` or `AGENT_PRIVATE_KEY`)
+
+## Installation
+
+```bash
+npm install
+cp .env.example .env
+npm run dev
 ```
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `transaction` | Yes | Hex-encoded sponsored Stacks transaction |
-| `settle.expectedRecipient` | Yes | Expected payment recipient address |
-| `settle.minAmount` | Yes | Minimum payment amount (in smallest unit) |
-| `settle.tokenType` | No | Token type: `STX`, `sBTC`, `USDCx` (default: `STX`) |
-| `settle.expectedSender` | No | Expected sender address for validation |
-| `settle.resource` | No | API resource being accessed (for tracking) |
-| `settle.method` | No | HTTP method being used (for tracking) |
+`npm run dev` starts Wrangler on the local worker. Most scripts under `scripts/` call `http://localhost:8787` unless `RELAY_URL` is set. The `dev`, test, and `keys` scripts load `.env` before they run. `.env` is gitignored.
 
-**Response (success):**
-```json
-{
-  "success": true,
-  "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "txid": "0x...",
-  "explorerUrl": "https://explorer.hiro.so/txid/0x...?chain=testnet",
-  "settlement": {
-    "success": true,
-    "status": "confirmed",
-    "sender": "SP...",
-    "recipient": "SP...",
-    "amount": "1000000",
-    "blockHeight": 12345
-  },
-  "sponsoredTx": "0x00000001...",
-  "receiptId": "550e8400-e29b-41d4-a716-446655440000"
-}
+```bash
+npm test          # unit tests (Vitest)
+npm run check     # tsc --noEmit
+npm run deploy:dry-run
 ```
 
-**Response (held / sender nonce gap):**
-```json
-{
-  "success": true,
-  "status": "held",
-  "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "queue": {
-    "senderNonce": 8,
-    "nextExpectedNonce": 5,
-    "missingNonces": [5, 6, 7],
-    "handSize": 1,
-    "estimatedDispatchMs": null,
-    "expiresAt": "2026-03-31T20:25:00.000Z",
-    "help": "Verify your account nonce at /fees or via the Stacks API, then submit transactions with nonces 5, 6, 7 to unblock dispatch"
-  }
-}
+## Configuration
+
+Set worker vars in `wrangler.jsonc`. Set secrets with `wrangler secret put` (or in `.env` / `.dev.vars` for local Wrangler). Names only:
+
+**Vars**
+
+| Name | Role |
+|---|---|
+| `STACKS_NETWORK` | `testnet` or `mainnet` |
+| `SPONSOR_WALLET_COUNT` | Wallets derived from the mnemonic (code default `1`; this repo sets `10`) |
+| `SPONSOR_WALLET_MAX` | Ceiling for dynamic pool scaling |
+| `FLUSH_RECIPIENT` | Recipient of nonce gap-fill transfers |
+| `ENABLE_SETTLE_RESPONSOR` | Declared in the worker env and set to `false` in `wrangler.jsonc`. The current `POST /settle` handler does not read it; an empty sponsor slot is always rejected |
+| `USE_WALLET_CAPACITY_STATE` | Wallet-capacity shape for `NonceDO` (default on) |
+| `SPONSOR_DAILY_BUDGET_USTX` | Daily sponsor fee cap in microSTX (default 10 STX) |
+| `SPONSOR_ALERT_MIN_USTX` | Low-balance alert threshold in microSTX (default 10 STX) |
+| `BROADCAST_NODE_URLS` | Comma-separated fallback Stacks node URLs |
+| `RELAY_BASE_URL` | Base URL embedded in payment status links |
+
+**Secrets**
+
+| Name | Role |
+|---|---|
+| `PAYMENT_SPONSOR_PRIVATE_KEY` | Hex key for `SponsorWalletDO` (public `/sponsor` and RPC sponsorship) |
+| `SPONSOR_MNEMONIC` | Mnemonic for the multi-wallet nonce pool |
+| `SPONSOR_PRIVATE_KEY` | Fallback hex key; wallet index 0 only |
+| `HIRO_API_KEY` | Optional Hiro API key for higher rate limits |
+| `CHAINHOOK_AUTH_TOKEN` | Bearer token required by `POST /webhook/chainhook` |
+| `TELEGRAM_BOT_TOKEN` | Sponsor alerts; both Telegram vars are required to send |
+| `TELEGRAM_CHAT_ID` | Sponsor alert destination |
+
+**Bindings** (declared in `wrangler.jsonc`, not secrets): `LOGS`, `RELAY_KV`, `API_KEYS_KV`, `NONCE_DO`, `STATS_DO`, `SPONSOR_WALLET_DO`, `SPONSOR_RATE_LIMIT`, `PAYMENT_QUEUE`.
+
+**Local scripts** (`.env`, see `.env.example`):
+
+| Name | Role |
+|---|---|
+| `AGENT_MNEMONIC` | Test account mnemonic |
+| `AGENT_PRIVATE_KEY` | Test account hex key, if no mnemonic |
+| `AGENT_ACCOUNT_INDEX` | Derivation index (default `0`) |
+| `RELAY_URL` | Target worker (default `http://localhost:8787`) |
+| `TEST_API_KEY` | Key for `npm run test:sponsor` and the SIP-018 sponsor script |
+| `TEST_RECIPIENT` | Payment recipient used by the test scripts |
+| `WRANGLER_ENV` | `staging` or `production` for `npm run keys` |
+| `KV_NAMESPACE_ID` | Optional override for the keys CLI |
+
+Deploy with the scripts in `package.json` after secrets are set for that environment:
+
+```bash
+npx wrangler secret put PAYMENT_SPONSOR_PRIVATE_KEY --env staging
+npm run deploy:staging
+npm run deploy:production
 ```
-
-Held queue behavior:
-- `POST /relay` returns HTTP `202` when the sender has a nonce gap.
-- Held entries remain queued for up to 15 minutes.
-- The alarm may conservatively repair stale-low sender frontiers after 5 minutes, with at most one Hiro refresh per sender every 10 minutes.
-- If the missing nonces arrive first, dispatch proceeds immediately without waiting for repair.
-
-> **Note:** `sponsoredTx` contains the fully-sponsored transaction hex (usable as `X-PAYMENT` header). `receiptId` is only returned when receipt storage succeeds (requires `RELAY_KV` binding).
-
-**Response (error):**
-```json
-{
-  "success": false,
-  "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "error": "Transaction must be sponsored",
-  "code": "NOT_SPONSORED",
-  "details": "Build transaction with sponsored: true",
-  "retryable": false
-}
-```
-
-### GET /verify/:receiptId
-
-Look up a payment receipt by ID and return its status.
-
-**Response (success):**
-```json
-{
-  "success": true,
-  "requestId": "...",
-  "receipt": {
-    "receiptId": "550e8400-...",
-    "status": "valid",
-    "createdAt": "2025-01-01T00:00:00.000Z",
-    "expiresAt": "2025-01-01T01:00:00.000Z",
-    "senderAddress": "SP...",
-    "txid": "0x...",
-    "explorerUrl": "https://explorer.hiro.so/txid/0x...?chain=testnet",
-    "settlement": {
-      "success": true,
-      "status": "confirmed",
-      "recipient": "SP...",
-      "amount": "1000000"
-    },
-    "resource": "/api/endpoint",
-    "method": "GET",
-    "accessCount": 0
-  }
-}
-```
-
-**Response (not found):** `404` for unknown or expired receipts.
-
-### POST /access
-
-Access a protected resource using a payment receipt. Validates the receipt (exists, not expired, not consumed, resource matches) and either returns relay-hosted data or proxies to a downstream service.
-
-**Request:**
-```json
-{
-  "receiptId": "550e8400-...",
-  "resource": "/api/endpoint",
-  "targetUrl": "https://downstream-service.com/api/endpoint"
-}
-```
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `receiptId` | Yes | Receipt ID from a successful relay transaction |
-| `resource` | No | Resource path (validated against receipt) |
-| `targetUrl` | No | Downstream URL for proxying (HTTPS only, no internal hosts) |
-
-**Response (success):**
-```json
-{
-  "success": true,
-  "requestId": "...",
-  "granted": true,
-  "receipt": {
-    "receiptId": "550e8400-...",
-    "senderAddress": "SP...",
-    "resource": "/api/endpoint",
-    "accessCount": 1
-  },
-  "data": { "..." }
-}
-```
-
-> **Note:** Receipts are one-time-use — consumed after successful access. If proxying, the receipt is only consumed on a 2xx downstream response. The `targetUrl` must be HTTPS and cannot point to internal hosts.
-
-### GET /health
-
-Service health summary. Use `GET /status/sponsor` to check whether the x402 payment sponsor can take a payment now.
-
-**Response:**
-```json
-{
-  "success": true,
-  "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "ok",
-  "network": "testnet",
-  "version": "0.3.0"
-}
-```
-
-### Status Surfaces
-
-- `RelayRPC.getSponsorStatus()` is the canonical internal sponsor status read for trusted same-account consumers such as `landing-page`.
-- `GET /status/sponsor` is the canonical public sponsor status read for autonomous agents and other HTTP consumers.
-- `GET /health` is only a thin service-readiness summary.
-- `GET /wallets` remains the detailed operator/debugging path for per-wallet balance and inventory and is intentionally separate from sponsor readiness.
-
-### GET /docs
-
-Interactive API documentation (Swagger UI).
-
-### GET /openapi.json
-
-OpenAPI 3.1 specification for programmatic access.
 
 ## Usage
 
-### Building a Sponsored Transaction
-
-Transactions must be built with `sponsored: true` and `fee: 0n`:
+Build a self-paid STX transfer with `@stacks/transactions` v7 (`serialize()` already returns hex) and settle it. `amount` is microSTX and must match the transaction. On staging, `network` is `stacks:2147483648`.
 
 ```typescript
-import { makeSTXTokenTransfer, getAddressFromPrivateKey, TransactionVersion } from "@stacks/transactions";
+import { AnchorMode, makeSTXTokenTransfer } from "@stacks/transactions";
 
-const senderAddress = getAddressFromPrivateKey(privateKey, TransactionVersion.Testnet);
-const recipient = "SP..."; // Payment recipient
-
+const recipient = "ST...";
 const transaction = await makeSTXTokenTransfer({
   recipient,
-  amount: 1000000n,
+  amount: 1000n,
   senderKey: privateKey,
   network: "testnet",
-  sponsored: true,  // Required
-  fee: 0n,          // Sponsor pays
+  anchorMode: AnchorMode.Any,
+  sponsored: false,
+  fee: 1000n,
 });
 
-const txHex = Buffer.from(transaction.serialize()).toString("hex");
-```
-
-### Submitting to the Relay
-
-```typescript
-const response = await fetch("https://x402-relay.aibtc.dev/relay", {
+const response = await fetch("https://x402-relay.aibtc.dev/settle", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
-    transaction: txHex,
-    settle: {
-      expectedRecipient: recipient,
-      minAmount: "1000000",
-      tokenType: "STX",
-      expectedSender: senderAddress,
+    x402Version: 2,
+    paymentPayload: {
+      x402Version: 2,
+      payload: { transaction: transaction.serialize() },
+    },
+    paymentRequirements: {
+      scheme: "exact",
+      network: "stacks:2147483648",
+      amount: "1000",
+      asset: "STX",
+      payTo: recipient,
+      maxTimeoutSeconds: 60,
     },
   }),
 });
 
-const { txid, settlement, sponsoredTx, receiptId } = await response.json();
-console.log(`Transaction: https://explorer.hiro.so/txid/${txid}?chain=testnet`);
-console.log(`Settlement status: ${settlement.status}`);
+const result = await response.json();
+// { success, payer, transaction, network } — HTTP 200 even when success is false
+```
 
-// Use receiptId to verify payment or access protected resources
-if (receiptId) {
-  const verifyResponse = await fetch(`https://x402-relay.aibtc.dev/verify/${receiptId}`);
-  const { receipt } = await verifyResponse.json();
-  console.log(`Receipt status: ${receipt.status}`);
+`POST /verify` takes the same body and returns `{ isValid, payer?, invalidReason? }` without broadcasting.
+
+Sponsor a transaction that was built with `sponsored: true` and fee `0`:
+
+```bash
+curl -s https://x402-relay.aibtc.dev/sponsor \
+  -H "Authorization: Bearer $TEST_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"transaction":"'"$TX_HEX"'"}'
+```
+
+A successful body is `{ success, requestId, txid, explorerUrl, fee }` with `fee` in microSTX.
+
+Provision a free-tier key. The timestamp must be within five minutes; the bare message without a timestamp is the registration path.
+
+```json
+POST /keys/provision-stx
+{
+  "stxAddress": "ST...",
+  "signature": "0x...",
+  "message": "Bitcoin will be the currency of AIs | 2026-02-16T12:00:00.000Z"
 }
 ```
 
-## Deployments
-
-| Environment | URL | Network |
-|-------------|-----|---------|
-| Staging | https://x402-relay.aibtc.dev | Testnet |
-| Production | https://x402-relay.aibtc.com | Mainnet |
-
-## All Endpoints
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/` | None | Service info |
-| GET | `/health` | None | Service health summary |
-| GET | `/status/sponsor` | None | x402 payment sponsor readiness (configured, funded, under daily budget) |
-| GET | `/docs` | None | Swagger UI documentation |
-| GET | `/openapi.json` | None | OpenAPI specification |
-| POST | `/relay` | None | Submit transaction via x402 facilitator |
-| POST | `/sponsor` | API Key | Sponsor and broadcast transaction directly |
-| GET | `/verify/:receiptId` | None | Verify a payment receipt |
-| POST | `/access` | None | Access protected resource with receipt |
-| GET | `/stats` | None | Relay statistics (JSON) |
-| GET | `/dashboard` | None | Public dashboard (HTML) |
-
-## Rate Limits
-
-### /relay Endpoint
-- 10 requests per minute per sender address
-- Rate limiting is based on the transaction sender, not IP
-
-### /sponsor Endpoint (API Key)
-
-Rate limits and spending caps are based on API key tier:
-
-| Tier | Requests/min | Requests/day | Daily Fee Cap |
-|------|-------------|--------------|---------------|
-| free | 10 | 100 | 100 STX |
-| standard | 60 | 10,000 | 1,000 STX |
-| unlimited | Unlimited | Unlimited | No cap |
-
-## API Key Authentication
-
-The `/sponsor` endpoint requires API key authentication.
-
-### Obtaining an API Key
-
-API keys are provisioned via the CLI:
+The API key is returned once. Manage keys against remote KV with:
 
 ```bash
-# Set your environment (staging = testnet, production = mainnet)
-export WRANGLER_ENV=staging
-
-# Create a new API key
-npm run keys -- create --app "My App" --email "dev@example.com"
-
-# Create with specific tier (default: free)
-npm run keys -- create --app "My App" --email "dev@example.com" --tier standard
-```
-
-### Managing API Keys
-
-```bash
-# List all API keys
+WRANGLER_ENV=staging npm run keys -- create --app "My App" --email "dev@example.com"
 WRANGLER_ENV=staging npm run keys -- list
-
-# Get info about a specific key
-WRANGLER_ENV=staging npm run keys -- info x402_sk_test_...
-
-# View usage statistics (last 7 days)
-WRANGLER_ENV=staging npm run keys -- usage x402_sk_test_... --days 7
-
-# Renew an expiring key (extends by 30 days)
-WRANGLER_ENV=staging npm run keys -- renew x402_sk_test_...
-
-# Revoke a key
-WRANGLER_ENV=staging npm run keys -- revoke x402_sk_test_...
+WRANGLER_ENV=staging npm run keys -- info "$TEST_API_KEY"
+WRANGLER_ENV=staging npm run keys -- usage "$TEST_API_KEY" --days 7
+WRANGLER_ENV=staging npm run keys -- renew "$TEST_API_KEY"
+WRANGLER_ENV=staging npm run keys -- revoke "$TEST_API_KEY"
 ```
 
-### Using API Keys
+Same-account workers bind the entrypoint and call it directly:
 
-Include the API key in the `Authorization` header:
+```jsonc
+{ "binding": "X402_RELAY", "service": "x402-sponsor-relay", "entrypoint": "RelayRPC" }
+```
 
 ```typescript
-const response = await fetch("https://x402-relay.aibtc.dev/sponsor", {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    "Authorization": "Bearer x402_sk_test_...",
-  },
-  body: JSON.stringify({ transaction: txHex }),
-});
+const sponsored = await env.X402_RELAY.sponsorPayment(txHex, settle);
+const queued = await env.X402_RELAY.submitPayment(txHex, settle);
+if (queued.accepted) {
+  const status = await env.X402_RELAY.checkPayment(queued.paymentId);
+}
+const ready = await env.X402_RELAY.getSponsorStatus();
 ```
 
-## Stack
-
-- **Cloudflare Workers** - Serverless deployment
-- **Hono** - Lightweight web framework
-- **Chanfana** - OpenAPI documentation generator
-- **@stacks/transactions** - Stacks transaction handling
-
-## Development
+Manual checks against a running worker:
 
 ```bash
-# Install dependencies
-npm install
-
-# Create .env and configure credentials (see Environment Variables below)
-# Required: AGENT_MNEMONIC or AGENT_PRIVATE_KEY for test scripts
-
-# Start local dev server
-npm run dev
-
-# Test /relay endpoint (no auth required)
-npm run test:relay                              # Uses RELAY_URL from .env or localhost
-npm run test:relay -- http://localhost:8787    # Override relay URL
-
-# Test /sponsor endpoint (requires API key)
-npm run test:sponsor                            # Uses TEST_API_KEY from .env
-npm run test:sponsor -- http://localhost:8787  # Override relay URL
-
-# Type check
-npm run check
+npm run test:settle
+npm run test:sponsor
+npm run test:fees
+npm run test:provision
+npm run test:provision-stx
+npm run test:sip018-auth
 ```
 
-### Environment Variables
+Pass a URL to override `RELAY_URL`: `npm run test:fees -- http://localhost:8787`.
 
-The test scripts support these environment variables (set in `.env`):
+## Project structure
 
-| Variable | Description |
-|----------|-------------|
-| `AGENT_MNEMONIC` | 24-word mnemonic phrase (recommended) |
-| `AGENT_PRIVATE_KEY` | Hex-encoded private key (alternative) |
-| `AGENT_ACCOUNT_INDEX` | Account index to derive from mnemonic (default: 0) |
-| `RELAY_URL` | Relay endpoint URL (default: http://localhost:8787) |
-| `TEST_API_KEY` | API key for /sponsor endpoint (required for test:sponsor) |
+```
+src/index.ts                 HTTP app, cron, and queue dispatch
+src/rpc.ts                   RelayRPC service binding
+src/endpoints/               Route handlers
+src/services/                Settlement, sponsorship, keys, fees, receipts
+src/durable-objects/         NonceDO, StatsDO, SponsorWalletDO
+src/queue-consumer.ts        Payment queue and dead-letter handling
+src/routes/discovery.ts      /llms.txt, /topics, agent card
+src/dashboard/               HTML dashboard
+src/middleware/              Logging, API-key auth, malformed-payload tracking
+scripts/                     Manual endpoint scripts and the keys CLI
+docs/                        Downstream contracts and operator notes
+wrangler.jsonc               Worker config, bindings, staging and production
+```
 
-## Related Projects
-
-- [x402 Protocol](https://www.x402.org/) - HTTP-native payment standard
-- [stx402](https://stx402.com) - x402 Stacks implementation
+Operator notes worth reading next to the code: [docs/post-337-downstream-contracts.md](docs/post-337-downstream-contracts.md), [docs/nonce-pool-operations.md](docs/nonce-pool-operations.md), and [docs/sponsor-ledger-lifecycle.md](docs/sponsor-ledger-lifecycle.md). Live endpoint reference is `GET /docs` and `GET /llms-full.txt`.
 
 ## License
 
-MIT
+This repository does not include a license file.
