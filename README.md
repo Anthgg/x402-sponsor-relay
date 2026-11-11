@@ -220,10 +220,13 @@ WRANGLER_ENV=staging npm run keys -- renew "$TEST_API_KEY"
 WRANGLER_ENV=staging npm run keys -- revoke "$TEST_API_KEY"
 ```
 
-Same-account workers bind the entrypoint and call it directly:
+Same-account workers bind the entrypoint and call it directly. The `service` name is the deployed worker name from `wrangler.jsonc`, not the npm package name:
 
 ```jsonc
-{ "binding": "X402_RELAY", "service": "x402-sponsor-relay", "entrypoint": "RelayRPC" }
+// local:      "x402-sponsor-relay"
+// staging:    "x402-sponsor-relay-staging"
+// production: "x402-sponsor-relay-production"
+{ "binding": "X402_RELAY", "service": "x402-sponsor-relay-staging", "entrypoint": "RelayRPC" }
 ```
 
 ```typescript
